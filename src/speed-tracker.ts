@@ -14,9 +14,18 @@ const MIN_DELTA_MS = 500;
 
 const CACHE_DIRNAME = 'speed-cache';
 const LEGACY_CACHE_FILENAME = '.speed-cache.json';
+// Fallback: approximate bytes-per-token ratio for transcript file growth estimation.
+// Claude's JSONL transcript is mostly ASCII with some overhead; ~4 bytes/token is a
+// reasonable ballpark that avoids wild over/under-estimates.
+const BYTES_PER_TOKEN = 4;
 
 interface SpeedCache {
   outputTokens: number;
+  timestamp: number;
+}
+
+interface FileSizeCache {
+  fileSize: number;
   timestamp: number;
 }
 
@@ -81,12 +90,56 @@ function removeLegacyCache(homeDir: string): void {
   }
 }
 
-export function getOutputSpeed(stdin: StdinData, overrides: Partial<SpeedTrackerDeps> = {}): number | null {
-  const outputTokens = stdin.context_window?.current_usage?.output_tokens;
-  if (typeof outputTokens !== 'number' || !Number.isFinite(outputTokens)) {
+/**
+ * Fallback speed estimation when output_tokens is unavailable.
+ *
+ * Measures the transcript file's byte-size growth between successive
+ * render calls and converts the delta to an approximate token/s rate
+ * using the BYTES_PER_TOKEN heuristic. This allows the HUD to show a
+ * speed reading even when the model provider (e.g. a non-standard
+ * proxy) does not populate `context_window.current_usage.output_tokens`.
+ */
+function getTranscriptSpeed(
+  transcriptPath: string,
+  homeDir: string,
+  now: number,
+): number | null {
+  try {
+    if (!fs.existsSync(transcriptPath)) return null;
+    const fileSize = fs.statSync(transcriptPath).size;
+
+    const cachePath = getCachePath(homeDir, transcriptPath) + '.fs';
+    let prev: FileSizeCache | null = null;
+    try {
+      if (fs.existsSync(cachePath)) {
+        prev = JSON.parse(fs.readFileSync(cachePath, 'utf8')) as FileSizeCache;
+      }
+    } catch {
+      /* ignore corrupt cache */
+    }
+
+    if (!prev || typeof prev.fileSize !== 'number') {
+      fs.writeFileSync(cachePath, JSON.stringify({ fileSize, timestamp: now }), 'utf8');
+      return null;
+    }
+
+    const deltaBytes = fileSize - prev.fileSize;
+    const deltaMs = now - prev.timestamp;
+
+    if (deltaMs > SPEED_WINDOW_MS || deltaMs < MIN_DELTA_MS || deltaBytes <= 0) {
+      fs.writeFileSync(cachePath, JSON.stringify({ fileSize, timestamp: now }), 'utf8');
+      return null;
+    }
+
+    const estimatedTokens = deltaBytes / BYTES_PER_TOKEN;
+    fs.writeFileSync(cachePath, JSON.stringify({ fileSize, timestamp: now }), 'utf8');
+    return estimatedTokens / (deltaMs / 1000);
+  } catch {
     return null;
   }
+}
 
+export function getOutputSpeed(stdin: StdinData, overrides: Partial<SpeedTrackerDeps> = {}): number | null {
   const transcriptPath = stdin.transcript_path?.trim();
   if (!transcriptPath) {
     // Without a stable session key we cannot safely isolate cache entries
@@ -100,38 +153,44 @@ export function getOutputSpeed(stdin: StdinData, overrides: Partial<SpeedTracker
 
   removeLegacyCache(homeDir);
 
-  const previous = readCache(homeDir, transcriptPath);
+  // Primary: use output_tokens when the provider supplies it.
+  const outputTokens = stdin.context_window?.current_usage?.output_tokens;
+  if (typeof outputTokens === 'number' && Number.isFinite(outputTokens)) {
+    const previous = readCache(homeDir, transcriptPath);
 
-  if (!previous) {
+    if (!previous) {
+      writeCache(homeDir, transcriptPath, { outputTokens, timestamp: now });
+      return null;
+    }
+
+    if (outputTokens < previous.outputTokens) {
+      writeCache(homeDir, transcriptPath, { outputTokens, timestamp: now });
+      return null;
+    }
+
+    const deltaTokens = outputTokens - previous.outputTokens;
+    const deltaMs = now - previous.timestamp;
+
+    if (deltaMs > SPEED_WINDOW_MS) {
+      writeCache(homeDir, transcriptPath, { outputTokens, timestamp: now });
+      return null;
+    }
+
+    if (deltaTokens <= 0) {
+      writeCache(homeDir, transcriptPath, { outputTokens, timestamp: now });
+      return null;
+    }
+
+    if (deltaMs < MIN_DELTA_MS) {
+      return null;
+    }
+
+    const speed = deltaTokens / (deltaMs / 1000);
     writeCache(homeDir, transcriptPath, { outputTokens, timestamp: now });
-    return null;
+    return speed;
   }
 
-  if (outputTokens < previous.outputTokens) {
-    writeCache(homeDir, transcriptPath, { outputTokens, timestamp: now });
-    return null;
-  }
-
-  let speed: number | null = null;
-  const deltaTokens = outputTokens - previous.outputTokens;
-  const deltaMs = now - previous.timestamp;
-
-  if (deltaMs > SPEED_WINDOW_MS) {
-    writeCache(homeDir, transcriptPath, { outputTokens, timestamp: now });
-    return null;
-  }
-
-  if (deltaTokens <= 0) {
-    writeCache(homeDir, transcriptPath, { outputTokens, timestamp: now });
-    return null;
-  }
-
-  if (deltaMs < MIN_DELTA_MS) {
-    return null;
-  }
-
-  speed = deltaTokens / (deltaMs / 1000);
-
-  writeCache(homeDir, transcriptPath, { outputTokens, timestamp: now });
-  return speed;
+  // Fallback: estimate from transcript file byte-size growth when the
+  // provider does not expose output_tokens (e.g. non-standard proxies).
+  return getTranscriptSpeed(transcriptPath, homeDir, now);
 }
