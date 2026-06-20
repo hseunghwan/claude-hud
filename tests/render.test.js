@@ -744,6 +744,51 @@ test('renderSessionLine keeps the legacy trailing provider label when showProvid
   }
 });
 
+test('renderProjectLine appends the effort label after the model when no provider is shown', () => {
+  const ctx = baseContext();
+  ctx.stdin.model = { display_name: 'Claude Opus 4.6' };
+  ctx.effortLevel = 'ultracode(xhigh)';
+  ctx.effortSymbol = '◕';
+  const line = stripAnsi(renderProjectLine(ctx) ?? '');
+  assert.ok(line.includes('[Claude Opus 4.6 ◕ ultracode(xhigh)]'), `got: ${line}`);
+});
+
+test('renderProjectLine keeps the effort label inside the model core with a custom provider', () => {
+  const ctx = baseContext();
+  ctx.stdin.model = { display_name: 'Claude Opus 4.6' };
+  ctx.config.display.showProvider = true;
+  ctx.config.display.providerName = 'MyProxy';
+  ctx.effortLevel = 'ultracode(xhigh)';
+  ctx.effortSymbol = '◕';
+  const line = stripAnsi(renderProjectLine(ctx) ?? '');
+  assert.ok(line.includes('[MyProxy | Claude Opus 4.6 ◕ ultracode(xhigh)]'), `got: ${line}`);
+});
+
+test('renderProjectLine renders the effort label after a trailing auto-detected provider', () => {
+  process.env.CLAUDE_CODE_USE_BEDROCK = '1';
+  try {
+    const ctx = baseContext();
+    ctx.stdin.model = { display_name: 'Claude Opus 4.6' };
+    ctx.effortLevel = 'ultracode(xhigh)';
+    ctx.effortSymbol = '◕';
+    const line = stripAnsi(renderProjectLine(ctx) ?? '');
+    assert.ok(line.includes('[Claude Opus 4.6 | Bedrock ◕ ultracode(xhigh)]'), `got: ${line}`);
+  } finally {
+    delete process.env.CLAUDE_CODE_USE_BEDROCK;
+  }
+});
+
+test('renderSessionLine composes the effort label with a custom provider (compact layout)', () => {
+  const ctx = baseContext();
+  ctx.stdin.model = { display_name: 'Claude Opus 4.6' };
+  ctx.config.display.showProvider = true;
+  ctx.config.display.providerName = 'MyProxy';
+  ctx.effortLevel = 'ultracode(xhigh)';
+  ctx.effortSymbol = '◕';
+  const line = stripAnsi(renderSessionLine(ctx));
+  assert.ok(line.includes('[MyProxy | Claude Opus 4.6 ◕ ultracode(xhigh)]'), `got: ${line}`);
+});
+
 test('renderProjectLine uses configurable element colors', () => {
   const ctx = baseContext();
   ctx.stdin.cwd = '/tmp/my-project';
